@@ -56,6 +56,51 @@ COASTLINE_SEGMENTS      = load_segments(COASTLINE_FILE, 'open-coast')
 INTERIOR_WATER_SEGMENTS = load_segments(INTERIOR_WATER_FILE, 'interior-water')
 
 # ---------------------------------------------------------------------------
+# Spatial grid index — avoids brute-forcing all 339K segments per request.
+# Divides the FL/TX bounding box into ~0.5° cells. Each segment is registered
+# in every cell its bounding box touches. A lookup returns only the candidate
+# segments for the cells near the query point.
+# ---------------------------------------------------------------------------
+GRID_CELL = 0.5  # degrees (~35 miles) — coarse enough to be fast, fine enough to be selective
+
+def build_grid_index(segments)
+  idx = Hash.new { |h, k| h[k] = [] }
+  segments.each_with_index do |(alat, alng, blat, blng), i|
+    min_row = ((([alat, blat].min - GRID_CELL) / GRID_CELL).floor)
+    max_row = ((([alat, blat].max + GRID_CELL) / GRID_CELL).ceil)
+    min_col = ((([alng, blng].min - GRID_CELL) / GRID_CELL).floor)
+    max_col = ((([alng, blng].max + GRID_CELL) / GRID_CELL).ceil)
+    (min_row..max_row).each { |r| (min_col..max_col).each { |c| idx[[r, c]] << i } }
+  end
+  idx
+end
+
+def candidates(lat, lng, segments, index)
+  row = (lat / GRID_CELL).floor
+  col = (lng / GRID_CELL).floor
+  seen = {}
+  result = []
+  (-1..1).each do |dr|
+    (-1..1).each do |dc|
+      (index[[row + dr, col + dc]] || []).each do |i|
+        next if seen[i]
+        seen[i] = true
+        result << segments[i]
+      end
+    end
+  end
+  result
+end
+
+COASTLINE_INDEX      = COASTLINE_SEGMENTS      ? build_grid_index(COASTLINE_SEGMENTS)      : {}
+INTERIOR_WATER_INDEX = INTERIOR_WATER_SEGMENTS ? build_grid_index(INTERIOR_WATER_SEGMENTS) : {}
+
+# Versioned GeoJSON etag — computed once at startup from file mtime so the
+# browser can cache the overlay aggressively and only re-fetch when rebuilt.
+COASTLINE_VERSION      = File.exist?(COASTLINE_FILE)      ? File.mtime(COASTLINE_FILE).to_i.to_s      : '0'
+INTERIOR_WATER_VERSION = File.exist?(INTERIOR_WATER_FILE) ? File.mtime(INTERIOR_WATER_FILE).to_i.to_s : '0'
+
+# ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
 def point_to_segment_projection(plat, plng, alat, alng, blat, blng)
@@ -82,10 +127,11 @@ def point_to_segment_projection(plat, plng, alat, alng, blat, blng)
   }
 end
 
-def nearest_shoreline(lat, lng, segments)
+def nearest_shoreline(lat, lng, segments, index = nil)
   return nil if segments.nil? || segments.empty?
+  pool = index ? candidates(lat, lng, segments, index) : segments
   nearest = nil
-  segments.each do |alat, alng, blat, blng|
+  pool.each do |alat, alng, blat, blng|
     projection = point_to_segment_projection(lat, lng, alat, alng, blat, blng)
     next unless projection.is_a?(Hash)
     if nearest.nil? || projection[:distance_mi] < nearest[:distance_mi]
@@ -106,11 +152,11 @@ end
 # ---------------------------------------------------------------------------
 def evaluate_coords(lat, lng, address_label)
   base = { address: address_label, lat: lat, lng: lng }
-  return base.merge(result: 'OUT_OF_AREA', reason: 'Address is outside FL/TX service area') unless in_service_area?(lat, lng)
+  return base.merge(result: 'OUT_OF_AREA', reason: 'Address is outside FL service area') unless in_service_area?(lat, lng)
   return base.merge(result: 'UNKNOWN', reason: 'Coastline data not loaded') if COASTLINE_SEGMENTS.nil?
 
-  open_shore     = nearest_shoreline(lat, lng, COASTLINE_SEGMENTS)
-  interior_shore = nearest_shoreline(lat, lng, INTERIOR_WATER_SEGMENTS)
+  open_shore     = nearest_shoreline(lat, lng, COASTLINE_SEGMENTS,      COASTLINE_INDEX)
+  interior_shore = nearest_shoreline(lat, lng, INTERIOR_WATER_SEGMENTS, INTERIOR_WATER_INDEX)
   dist_mi        = open_shore && open_shore[:distance_mi]
   finite         = dist_mi && dist_mi.finite? ? dist_mi : nil
 
@@ -122,13 +168,12 @@ def evaluate_coords(lat, lng, address_label)
   )
 
   if finite && finite <= COASTAL_RADIUS_MI
-    payload.merge(result: 'COASTAL',
-      reason: "#{finite.round(2)} miles from ocean coastline — flag for valuation review",
+    payload.merge(result: 'YES',
+      reason: "#{finite.round(2)} miles from coast",
       advisory_reason: interior_shore ? "#{interior_shore[:distance_mi].round(2)} miles from nearest interior bay / lagoon shoreline" : nil)
   else
-    payload.merge(result: 'NOT_COASTAL',
-      reason: finite ? "#{finite.round(2)} miles from ocean coastline — no coastal flag needed"
-                     : "More than 2 miles from ocean coastline — no coastal flag needed",
+    payload.merge(result: 'NO',
+      reason: finite ? "#{finite.round(2)} miles from coast" : "More than 2 miles from coast",
       advisory_reason: interior_shore ? "#{interior_shore[:distance_mi].round(2)} miles from nearest interior bay / lagoon shoreline" : nil)
   end
 end
@@ -179,38 +224,21 @@ get '/api/check_coords' do
   halt 400, { error: 'Valid lat and lng required' }.to_json unless valid_coordinate_pair?(lat, lng)
   evaluate_coords(lat, lng, "#{lat.round(5)}, #{lng.round(5)}").to_json
 end
-get '/coastline.geojson' do content_type 'application/geo+json'; cache_control :no_cache; send_file COASTLINE_FILE end
-get '/interior_water.geojson' do content_type 'application/geo+json'; cache_control :no_cache; send_file INTERIOR_WATER_FILE end
-get '/editor' do erb :editor end
-
-post '/admin/rebuild' do
-  content_type :json
-  begin
-    result = `cd #{__dir__} && bundle exec ruby bin/setup_coastline.rb 2>&1`
-    { ok: true, output: result }.to_json
-  rescue => e
-    halt 500, { error: e.message }.to_json
-  end
+get '/coastline.geojson' do
+  content_type 'application/geo+json'
+  cache_control :public, max_age: 86400
+  etag COASTLINE_VERSION
+  send_file COASTLINE_FILE
 end
-
-post '/admin/save_supplemental' do
+get '/interior_water.geojson' do
+  content_type 'application/geo+json'
+  cache_control :public, max_age: 86400
+  etag INTERIOR_WATER_VERSION
+  send_file INTERIOR_WATER_FILE
+end
+get '/health' do
   content_type :json
-  begin
-    data = JSON.parse(request.body.read)
-    segments = data['segments'] # array of {name, coords: [[lng,lat],...]}
-    setup_path = File.join(__dir__, 'bin', 'setup_coastline.rb')
-    src = File.read(setup_path)
-    ruby_array = segments.map do |seg|
-      coord_lines = seg['coords'].map { |c| "      [#{c[0]}, #{c[1]}]" }.join(",\n")
-      "  {\n    'type' => 'Feature',\n    'properties' => { 'name' => '#{seg['name']}', 'source' => 'custom' },\n    'geometry' => { 'type' => 'LineString', 'coordinates' => [\n#{coord_lines},\n    ] }\n  }"
-    end.join(",\n\n")
-    new_block = "SUPPLEMENTAL_COASTAL_FEATURES = [\n\n#{ruby_array},\n\n].freeze"
-    updated = src.sub(/SUPPLEMENTAL_COASTAL_FEATURES = \[.*?\]\.freeze/m, new_block)
-    File.write(setup_path, updated)
-    { ok: true, count: segments.size }.to_json
-  rescue => e
-    halt 500, { error: e.message }.to_json
-  end
+  { ok: true, segments: COASTLINE_SEGMENTS&.size || 0, version: COASTLINE_VERSION }.to_json
 end
 
 # ---------------------------------------------------------------------------
@@ -224,7 +252,7 @@ __END__
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Coastal Check</title>
+  <title>CoastFinder</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
     integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
   <style>
@@ -406,8 +434,8 @@ __END__
 </div>
 
 <div class="drop-panel">
-  <div class="drop-title">Drop Here</div>
-  <div class="drop-copy">Place the property first. Search is optional.</div>
+  <div class="drop-title">CoastFinder</div>
+  <div class="drop-copy">Florida coastal proximity check. Search an address or drop a pin.</div>
   <button class="drop-btn" id="drop-pin-btn" type="button">Drop Property Pin</button>
   <div class="drop-hint" id="drop-pin-hint">Tip: double-click anywhere on the map to drop a pin instantly.</div>
 </div>
@@ -610,7 +638,7 @@ function updateReferenceUi(data) {
     if (reference && reference.distance != null && isFinite(reference.distance)) {
       distValue.textContent = Number(reference.distance).toFixed(2);
       distUnit.textContent = 'mi';
-    } else if (data.result === 'NOT_COASTAL') {
+    } else if (data.result === 'NO') {
       distValue.textContent = '> 2';
       distUnit.textContent = 'mi';
     } else {
@@ -848,23 +876,23 @@ function setLiveDragState(on) {
 function updateResultBadge(data) {
   var badgeEl = document.getElementById('result-badge');
   badgeEl.className = 'result-badge ' + {
-    COASTAL: 'badge-coastal', NOT_COASTAL: 'badge-not-coastal',
+    YES: 'badge-coastal', NO: 'badge-not-coastal',
     OUT_OF_AREA: 'badge-out', UNKNOWN: 'badge-unknown'
   }[data.result];
   badgeEl.textContent = {
-    COASTAL: 'Coastal — Flag for Review', NOT_COASTAL: 'Not Coastal',
-    OUT_OF_AREA: 'Outside FL / TX', UNKNOWN: 'Unknown'
+    YES: 'Yes — Flagged for Review', NO: 'No — Not Coastal',
+    OUT_OF_AREA: 'Out of Area', UNKNOWN: 'Unknown'
   }[data.result];
 }
 
 function updateDistanceMetrics(data) {
-  document.getElementById('open-distance-detail').textContent = formatMiles(data.distance_mi, data.result === 'NOT_COASTAL' ? '> 2 mi' : '--');
+  document.getElementById('open-distance-detail').textContent = formatMiles(data.distance_mi, data.result === 'NO' ? '> 2 mi' : '--');
   document.getElementById('interior-distance-detail').textContent = formatMiles(data.interior_distance_mi, 'None');
 }
 
 function updateOfficialGeometryForCurrentResult() {
   if (!currentResult) return;
-  var ringColor = currentResult.result === 'COASTAL' ? '#f97316' : (currentResult.result === 'NOT_COASTAL' ? '#22c55e' : '#8e8e93');
+  var ringColor = currentResult.result === 'YES' ? '#f97316' : (currentResult.result === 'NO' ? '#22c55e' : '#8e8e93');
   var reference = getActiveReference(currentResult);
 
   if (activeMapProvider === 'google') {
@@ -931,7 +959,7 @@ function scheduleDragPreview(lat, lng) {
 
 function drawResultGeometry(data, animate) {
   clearOfficialGraphics();
-  var ringColor = data.result === 'COASTAL' ? '#f97316' : (data.result === 'NOT_COASTAL' ? '#22c55e' : '#8e8e93');
+  var ringColor = data.result === 'YES' ? '#f97316' : (data.result === 'NO' ? '#22c55e' : '#8e8e93');
   var reference = getActiveReference(data);
 
   if (activeMapProvider === 'google') {
@@ -1165,210 +1193,3 @@ document.addEventListener('DOMContentLoaded', function() {
 </body>
 </html>
 
-@@editor
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Coastline Editor</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; height: 100vh; overflow: hidden; background: #1c1c1e; color: #f2f2f7; }
-    #map { flex: 1; height: 100vh; }
-    #panel { width: 320px; display: flex; flex-direction: column; background: #2c2c2e; border-left: 1px solid #3a3a3c; }
-    #panel h1 { font-size: 14px; font-weight: 700; padding: 14px 16px 10px; border-bottom: 1px solid #3a3a3c; color: #f2f2f7; letter-spacing: 0.02em; }
-    #seg-list { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
-    .seg-item { background: #3a3a3c; border-radius: 8px; padding: 10px 12px; cursor: pointer; border: 2px solid transparent; transition: border-color 0.15s; }
-    .seg-item.active { border-color: #0a84ff; }
-    .seg-name { font-size: 12px; font-weight: 600; color: #f2f2f7; margin-bottom: 3px; }
-    .seg-meta { font-size: 11px; color: #8e8e93; }
-    .seg-actions { display: flex; gap: 6px; margin-top: 8px; }
-    .btn { font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 5px; border: none; cursor: pointer; }
-    .btn-blue { background: #0a84ff; color: #fff; }
-    .btn-red  { background: #ff453a; color: #fff; }
-    .btn-gray { background: #48484a; color: #f2f2f7; }
-    #footer { padding: 12px; border-top: 1px solid #3a3a3c; display: flex; flex-direction: column; gap: 8px; }
-    #add-seg { width: 100%; padding: 9px; background: #0a84ff; color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
-    #save-btn { width: 100%; padding: 9px; background: #30d158; color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
-    #status { font-size: 11px; color: #8e8e93; text-align: center; min-height: 16px; }
-    #rebuild-btn { width: 100%; padding: 9px; background: #ff9f0a; color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
-  </style>
-</head>
-<body>
-<div id="map"></div>
-<div id="panel">
-  <h1>Coastline Segment Editor</h1>
-  <div id="seg-list"></div>
-  <div id="footer">
-    <button id="add-seg">+ New Segment</button>
-    <button id="save-btn">💾 Save to setup_coastline.rb</button>
-    <button id="rebuild-btn">⚙️ Rebuild &amp; Restart App</button>
-    <div id="status"></div>
-  </div>
-</div>
-
-<script>
-var map, segments = [], polylines = [], activeIdx = null;
-
-var COLORS = ['#0a84ff','#ff453a','#30d158','#ff9f0a','#bf5af2','#64d2ff','#ff6961','#ffd60a'];
-
-// ── Seed current segments from setup_coastline.rb output ──
-var SEED = [
-  { name: 'Charlotte Harbor northern shore (Port Charlotte)', coords: [[-82.130,26.938],[-82.110,26.936],[-82.090,26.934],[-82.072,26.931],[-82.056,26.930]] },
-  { name: 'Charlotte Harbor eastern shore', coords: [[-82.056,26.930],[-82.045,26.905],[-82.028,26.878],[-82.011,26.850],[-81.997,26.822],[-81.982,26.795],[-81.967,26.768],[-81.953,26.740],[-81.943,26.712],[-81.937,26.682]] },
-  { name: 'Caloosahatchee — Fort Myers south bank', coords: [[-81.963,26.638],[-81.943,26.638],[-81.922,26.638],[-81.902,26.639],[-81.882,26.640],[-81.862,26.641]] },
-  { name: 'Pine Island Sound / Matlacha Pass eastern shore', coords: [[-82.097,26.872],[-82.109,26.843],[-82.111,26.815],[-82.105,26.787],[-82.094,26.759],[-82.080,26.732],[-82.066,26.706],[-82.052,26.679],[-82.039,26.654],[-82.028,26.638]] },
-  { name: 'Gasparilla Sound — island (east) shore', coords: [[-82.266,26.732],[-82.261,26.752],[-82.256,26.772],[-82.253,26.793],[-82.252,26.814],[-82.254,26.836]] },
-  { name: 'Gasparilla Sound — mainland (west) shore', coords: [[-82.240,26.843],[-82.233,26.823],[-82.229,26.803],[-82.227,26.782],[-82.228,26.760],[-82.231,26.739],[-82.238,26.722]] },
-  { name: 'North Pinellas Gulf coast (Honeymoon Is. / Caladesi Is.)', coords: [[-82.820,28.110],[-82.820,28.095],[-82.821,28.080],[-82.822,28.065],[-82.824,28.050],[-82.826,28.035],[-82.828,28.020],[-82.829,28.005],[-82.829,27.990],[-82.829,27.975]] }
-];
-
-function initMap() {
-  map = new google.maps.Map(document.getElementById('map'), {
-    center: { lat: 26.8, lng: -82.05 }, zoom: 10,
-    mapTypeId: 'roadmap',
-    styles: [
-      { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#b8d9ea' }] },
-      { featureType: 'landscape', elementType: 'geometry', stylers: [{ color: '#f5f5f0' }] },
-      { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#ffffff' }] },
-      { featureType: 'poi', stylers: [{ visibility: 'off' }] },
-      { featureType: 'transit', stylers: [{ visibility: 'off' }] }
-    ]
-  });
-
-  // Right-click on map to add point to active segment
-  map.addListener('rightclick', function(e) {
-    if (activeIdx === null) { setStatus('Select a segment first, then right-click to add points.'); return; }
-    var lng = e.latLng.lng(), lat = e.latLng.lat();
-    segments[activeIdx].coords.push([parseFloat(lng.toFixed(5)), parseFloat(lat.toFixed(5))]);
-    redrawPolyline(activeIdx);
-    renderList();
-  });
-
-  SEED.forEach(function(s) { segments.push({ name: s.name, coords: s.coords.map(function(c){ return c.slice(); }) }); });
-  renderAll();
-}
-
-function renderAll() {
-  polylines.forEach(function(p) { if (p) p.setMap(null); });
-  polylines = [];
-  segments.forEach(function(_, i) { polylines.push(null); redrawPolyline(i); });
-  renderList();
-}
-
-function redrawPolyline(i) {
-  if (polylines[i]) polylines[i].setMap(null);
-  var seg = segments[i];
-  var color = COLORS[i % COLORS.length];
-  var path = seg.coords.map(function(c) { return { lat: c[1], lng: c[0] }; });
-  var poly = new google.maps.Polyline({
-    path: path, map: map,
-    editable: true, geodesic: false,
-    strokeColor: color, strokeWeight: 3, strokeOpacity: 0.9
-  });
-  // Sync edits back to segments array
-  function syncPath() {
-    var pts = poly.getPath();
-    seg.coords = [];
-    for (var k = 0; k < pts.getLength(); k++) {
-      var p = pts.getAt(k);
-      seg.coords.push([parseFloat(p.lng().toFixed(5)), parseFloat(p.lat().toFixed(5))]);
-    }
-  }
-  google.maps.event.addListener(poly.getPath(), 'set_at', syncPath);
-  google.maps.event.addListener(poly.getPath(), 'insert_at', syncPath);
-  google.maps.event.addListener(poly.getPath(), 'remove_at', syncPath);
-  poly.addListener('click', function() { setActive(i); });
-  polylines[i] = poly;
-}
-
-function renderList() {
-  var list = document.getElementById('seg-list');
-  list.innerHTML = '';
-  segments.forEach(function(seg, i) {
-    var div = document.createElement('div');
-    div.className = 'seg-item' + (i === activeIdx ? ' active' : '');
-    div.style.borderColor = i === activeIdx ? COLORS[i % COLORS.length] : 'transparent';
-    div.innerHTML =
-      '<div class="seg-name" style="color:' + COLORS[i % COLORS.length] + '">' + seg.name + '</div>' +
-      '<div class="seg-meta">' + seg.coords.length + ' points</div>' +
-      '<div class="seg-actions">' +
-        '<button class="btn btn-blue" data-action="rename" data-i="' + i + '">Rename</button>' +
-        '<button class="btn btn-red"  data-action="delete" data-i="' + i + '">Delete</button>' +
-        '<button class="btn btn-gray" data-action="focus"  data-i="' + i + '">Zoom</button>' +
-      '</div>';
-    div.addEventListener('click', function() { setActive(i); });
-    list.appendChild(div);
-  });
-}
-
-function setActive(i) {
-  activeIdx = i;
-  renderList();
-}
-
-document.getElementById('seg-list').addEventListener('click', function(e) {
-  var btn = e.target.closest('[data-action]');
-  if (!btn) return;
-  e.stopPropagation();
-  var i = parseInt(btn.dataset.i);
-  var action = btn.dataset.action;
-  if (action === 'delete') {
-    if (!confirm('Delete "' + segments[i].name + '"?')) return;
-    polylines[i].setMap(null);
-    segments.splice(i, 1);
-    polylines.splice(i, 1);
-    if (activeIdx >= segments.length) activeIdx = segments.length - 1;
-    renderAll();
-  } else if (action === 'rename') {
-    var n = prompt('Segment name:', segments[i].name);
-    if (n) { segments[i].name = n; renderList(); }
-  } else if (action === 'focus') {
-    var bounds = new google.maps.LatLngBounds();
-    segments[i].coords.forEach(function(c) { bounds.extend({ lat: c[1], lng: c[0] }); });
-    map.fitBounds(bounds, 60);
-    setActive(i);
-  }
-});
-
-document.getElementById('add-seg').addEventListener('click', function() {
-  var n = prompt('Segment name:');
-  if (!n) return;
-  segments.push({ name: n, coords: [] });
-  polylines.push(null);
-  var i = segments.length - 1;
-  redrawPolyline(i);
-  setActive(i);
-  renderList();
-  setStatus('Right-click on the map to add points to the new segment.');
-});
-
-document.getElementById('save-btn').addEventListener('click', function() {
-  setStatus('Saving...');
-  fetch('/admin/save_supplemental', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ segments: segments })
-  }).then(function(r) { return r.json(); }).then(function(d) {
-    if (d.ok) setStatus('✅ Saved ' + d.count + ' segments to setup_coastline.rb');
-    else setStatus('❌ ' + (d.error || 'Unknown error'));
-  }).catch(function(e) { setStatus('❌ ' + e.message); });
-});
-
-document.getElementById('rebuild-btn').addEventListener('click', function() {
-  setStatus('Rebuilding coastline data...');
-  fetch('/admin/rebuild', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
-    if (d.ok) setStatus('✅ Rebuilt! Reload the main app to see changes.');
-    else setStatus('❌ ' + (d.error || 'Failed'));
-  }).catch(function(e) { setStatus('❌ ' + e.message); });
-});
-
-function setStatus(msg) { document.getElementById('status').textContent = msg; }
-
-window.initMap = initMap;
-var s = document.createElement('script'); s.async = true; s.defer = true;
-s.src = 'https://maps.googleapis.com/maps/api/js?key=<%= google_maps_browser_key %>&callback=initMap';
-document.head.appendChild(s);
-</script>
-</body>
-</html>

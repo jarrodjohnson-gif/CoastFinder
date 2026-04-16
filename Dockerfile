@@ -15,4 +15,4 @@ RUN test -s data/coastline.geojson && test -s data/interior_water.geojson
 EXPOSE 4567
 ENV PORT=4567
 
-CMD ["bundle", "exec", "ruby", "app.rb"]
+CMD ["bundle", "exec", "puma", "-C", "config/puma.rb"]

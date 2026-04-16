@@ -392,10 +392,14 @@ puts
 # ---------------------------------------------------------------------------
 
 AREAWATER_COUNTIES = {
-  'Sarasota County FL' => '12115',   # Lemon Bay, Little Sarasota Bay
-  'Charlotte County FL' => '12015',  # Charlotte Harbor, Gasparilla Sound
-  'Lee County FL'       => '12071',  # Pine Island Sound, Matlacha Pass, San Carlos Bay, Estero Bay, Caloosahatchee
-  'Collier County FL'   => '12021',  # Naples Bay
+  'Sarasota County FL'    => '12115',  # Lemon Bay, Little Sarasota Bay
+  'Manatee County FL'     => '12081',  # Anna Maria Sound, northern Sarasota Bay, Terra Ceia Bay
+  'Charlotte County FL'   => '12015',  # Charlotte Harbor, Gasparilla Sound
+  'Lee County FL'         => '12071',  # Pine Island Sound, Matlacha Pass, San Carlos Bay, Estero Bay, Caloosahatchee
+  'Collier County FL'     => '12021',  # Naples Bay
+  'Hillsborough County FL' => '12057', # Old Tampa Bay, Hillsborough Bay, Davis Islands, Gandy area
+  'Pinellas County FL'    => '12103',  # Boca Ciega Bay, St. Pete inner bay waters
+  'Miami-Dade County FL'  => '12086',  # Biscayne Bay — fixes Chicken Key / outer bay coverage
 }.freeze
 
 MIN_AWATER_M2 = 2_000_000  # 2 km² minimum — filters tiny ponds, keeps all navigable bays
@@ -500,11 +504,29 @@ puts
 # ---------------------------------------------------------------------------
 SUPPLEMENTAL_COASTAL_FEATURES = [
 
+  # ── Caloosahatchee River — tidal/estuarine reach ───────────────────────
+  # AREAWATER classifies the Caloosahatchee as H3010 (stream/river), not H2051,
+  # so it's excluded from the bay/estuary filter above. The lower tidal reach
+  # from the Charlotte Harbor junction east to Fort Myers is navigable open water
+  # and waterfront properties here should be flagged COASTAL.
+  {
+    'type' => 'Feature',
+    'properties' => { 'name' => 'Caloosahatchee River — tidal reach (Cape Coral / Fort Myers)', 'source' => 'custom' },
+    'geometry' => { 'type' => 'LineString', 'coordinates' => [
+      [-81.993, 26.653],  # Charlotte Harbor / river junction (west)
+      [-81.970, 26.648],
+      [-81.950, 26.644],
+      [-81.930, 26.641],
+      [-81.910, 26.640],
+      [-81.890, 26.640],
+      [-81.862, 26.641],  # Downtown Fort Myers / Centennial Park (east)
+    ] }
+  },
+
   # ── North Pinellas Gulf coast gap fill ─────────────────────────────────
   # Census L4150 has good coverage at Tarpon Springs (~28.13°N) and at
   # Clearwater Beach (~27.97°N), but the Honeymoon Island / Caladesi Island
   # barrier island stretch in between has a data gap.
-
   {
     'type' => 'Feature',
     'properties' => { 'name' => 'North Pinellas Gulf coast (Honeymoon Is. / Caladesi Is.)', 'source' => 'custom' },
